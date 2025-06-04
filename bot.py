@@ -1,6 +1,5 @@
 import logging
 import os
-import base64
 import json
 import gspread
 from telegram import (
@@ -30,10 +29,10 @@ logger = logging.getLogger(__name__)
 # Получение переменных окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
-GOOGLE_CREDS_BASE64 = os.getenv('GOOGLE_CREDS_BASE64')
+GOOGLE_CREDS_JSON = os.getenv('GOOGLE_CREDS_JSON')
 
 # Проверка наличия переменных
-if not all([TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_CREDS_BASE64]):
+if not all([TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_CREDS_JSON]):
     logger.error("Не все обязательные переменные окружения установлены!")
     exit(1)
 
@@ -43,9 +42,8 @@ SELECTING_ACTION, VIEW_DATE, EDIT_DATE, EDIT_WORKOUT, EDIT_VOLUME, EDIT_GOAL, AD
 # Инициализация Google Sheets
 def init_google_sheets():
     try:
-        # Декодируем credentials
-        creds_json = base64.b64decode(GOOGLE_CREDS_BASE64).decode('utf-8')
-        creds_dict = json.loads(creds_json)
+        # Загружаем JSON из строки
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
         
         scopes = [
             'https://www.googleapis.com/auth/spreadsheets',
@@ -56,7 +54,7 @@ def init_google_sheets():
         client = gspread.authorize(creds)
         return client.open_by_key(SPREADSHEET_ID).sheet1
     except Exception as e:
-        logger.error(f"Ошибка инициализации Google Sheets: {e}")
+        logger.error(f"Ошибка инициализации Google Sheets: {e}", exc_info=True)
         raise
 
 # Получение данных о тренировке по дате
