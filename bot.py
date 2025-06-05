@@ -96,9 +96,11 @@ async def enter_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Поиск даты в таблице
     result = await asyncio.to_thread(find_date_in_sheet, date_str)
     if not result:
+        # ИСПРАВЛЕННАЯ СТРОКА: добавлены закрывающие скобки
         await update.message.reply_text(
             f"Дата {date_str} НЕ найдена в плане. Введите новую дату",
             reply_markup=ReplyKeyboardMarkup([['Сегодня']], resize_keyboard=True)
+        )
         return ENTER_DATE
     
     # Сохранение данных в контексте
