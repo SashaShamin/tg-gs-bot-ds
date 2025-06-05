@@ -1,380 +1,352 @@
-import logging
 import os
+import re
 import json
-import gspread
+import datetime
+import logging
+import asyncio
 from telegram import (
-    Update, 
     ReplyKeyboardMarkup, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
     ReplyKeyboardRemove,
-    KeyboardButton
+    Update
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ConversationHandler,
+    CallbackQueryHandler,
     ContextTypes,
+    ConversationHandler,
     filters
 )
-from datetime import datetime
+import gspread
 from google.oauth2.service_account import Credentials
 
-# Настройка логирования
+# Настройка логгирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Получение переменных окружения
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
-GOOGLE_CREDS_JSON = os.getenv('GOOGLE_CREDS_JSON')
+# Состояния разговора
+(
+    ENTER_DATE, 
+    FOUND_DATE,
+    CHANGE_TRAIN_FIELD,
+    TRAIN_ANSWER,
+    CHANGE_CONTENT_FIELD,
+    CONTENT_ANSWER,
+    CHANGE_TARGET_FIELD,
+    TARGET_ANSWER
+) = range(8)
 
-# Проверка наличия переменных
-if not all([TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_CREDS_JSON]):
-    logger.error("Не все обязательные переменные окружения установлены!")
-    exit(1)
+# Глобальные переменные
+worksheet = None
 
-# Состояния для ConversationHandler
-SELECTING_ACTION, VIEW_DATE, EDIT_DATE, EDIT_WORKOUT, EDIT_VOLUME, EDIT_GOAL, ADD_TEXT = range(7)
-
-# Инициализация Google Sheets
-def init_google_sheets():
-    try:
-        # Загружаем JSON из строки
-        creds_dict = json.loads(GOOGLE_CREDS_JSON)
-        
-        scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        return client.open_by_key(SPREADSHEET_ID).sheet1
-    except Exception as e:
-        logger.error(f"Ошибка инициализации Google Sheets: {e}", exc_info=True)
-        raise
-
-# Получение данных о тренировке по дате
-def get_training_data(date: str, worksheet):
-    try:
-        date_cell = worksheet.find(date)
-        row = worksheet.row_values(date_cell.row)
-        return {
-            'date': row[0],
-            'type': row[1] if len(row) > 1 else None,
-            'workout': row[2] if len(row) > 2 else None,
-            'volume': row[3] if len(row) > 3 else None,
-            'goal': row[4] if len(row) > 4 else None
-        }
-    except gspread.exceptions.CellNotFound:
-        return None
-    except Exception as e:
-        logger.error(f"Ошибка при получении данных: {e}")
-        return None
-
-# Обновление данных в таблице
-def update_training_data(date: str, field: str, value: str, worksheet, append=False):
-    try:
-        date_cell = worksheet.find(date)
-        col_idx = {'workout': 3, 'volume': 4, 'goal': 5}.get(field)
-        
-        if not col_idx:
-            return False
-        
-        if append:
-            current_value = worksheet.cell(date_cell.row, col_idx).value or ""
-            value = f"{current_value} {value}".strip()
-        
-        worksheet.update_cell(date_cell.row, col_idx, value)
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении данных: {e}")
-        return False
-
-# ===================== Обработчики команд =====================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = [['Посмотреть тренировку', 'Изменить тренировку']]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+def init_google_sheet():
+    """Инициализация подключения к Google Таблице"""
+    creds_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
+    sheet_id = os.environ.get('GOOGLE_SHEET_ID')
     
+    if not creds_json or not sheet_id:
+        raise ValueError("Не заданы переменные окружения")
+    
+    creds_data = json.loads(creds_json)
+    scope = ['https://spreadsheets.google.com/feeds', 
+             'https://www.googleapis.com/auth/drive',
+             'https://www.googleapis.com/auth/spreadsheets']
+    
+    creds = Credentials.from_service_account_info(creds_data, scopes=scope)
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(sheet_id).sheet1
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    reply_markup = ReplyKeyboardMarkup([['Сегодня']], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        "Выберите дальнейшее действие:",
+        "Введите дату тренировки в формате ДД.ММ.ГГГГ",
         reply_markup=reply_markup
     )
-    return SELECTING_ACTION
+    return ENTER_DATE
 
-async def view_training(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "Введите дату тренировки (в формате ДД.ММ.ГГГГ):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    return VIEW_DATE
-
-async def handle_view_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    date = update.message.text
-    worksheet = context.bot_data.get('worksheet')
-    
-    if not is_valid_date(date):
-        await update.message.reply_text("Неверный формат даты. Используйте ДД.ММ.ГГГГ")
-        return VIEW_DATE
-    
-    training_data = get_training_data(date, worksheet)
-    
-    if not training_data:
-        await update.message.reply_text("В данном периоде тренировок не предусмотрено.")
-        return ConversationHandler.END
-    
-    response = (
-        f"{training_data['date']} "
-        f"{training_data['type'] or 'Не заполнено'} тренировка. "
-        f"Подобранная нагрузка {training_data['workout'] or 'Не заполнено'}, "
-        f"ее объем и содержание {training_data['volume'] or 'Не заполнено'}, "
-        f"ее цель {training_data['goal'] or 'Не заполнено'}."
-    )
-    
-    await update.message.reply_text(response)
-    return ConversationHandler.END
-
-async def edit_training(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    today_btn = KeyboardButton("Сегодня")
-    keyboard = [[today_btn]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        "Введите дату тренировки или нажмите 'Сегодня':",
-        reply_markup=reply_markup
-    )
-    return EDIT_DATE
-
-async def handle_edit_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def enter_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ввода даты пользователем"""
     user_input = update.message.text
-    worksheet = context.bot_data.get('worksheet')
     
-    if user_input == "Сегодня":
-        date = datetime.now().strftime("%d.%m.%Y")
+    # Обработка кнопки "Сегодня"
+    if user_input == 'Сегодня':
+        date_str = datetime.datetime.now().strftime('%d.%m.%Y')
     else:
-        date = user_input
+        # Проверка формата даты
+        if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', user_input):
+            await update.message.reply_text("Неверный формат. Введите дату в формате ДД.ММ.ГГГГ")
+            return ENTER_DATE
+        
+        # Проверка валидности даты
+        try:
+            day, month, year = user_input.split('.')
+            datetime.datetime(int(year), int(month), int(day))
+            date_str = user_input
+        except ValueError:
+            await update.message.reply_text("Некорректная дата. Введите правильную дату")
+            return ENTER_DATE
     
-    if not is_valid_date(date):
-        await update.message.reply_text("Неверный формат даты. Используйте ДД.ММ.ГГГГ")
-        return EDIT_DATE
+    # Поиск даты в таблице
+    result = await asyncio.to_thread(find_date_in_sheet, date_str)
+    if not result:
+        await update.message.reply_text(
+            f"Дата {date_str} НЕ найдена в плане. Введите новую дату",
+            reply_markup=ReplyKeyboardMarkup([['Сегодня']], resize_keyboard=True)
+        return ENTER_DATE
     
-    training_data = get_training_data(date, worksheet)
+    # Сохранение данных в контексте
+    row_idx, row_data = result
+    context.user_data.update({
+        'date': date_str,
+        'row_idx': row_idx,
+        'train': row_data.get(5, ''),
+        'content': row_data.get(6, ''),
+        'target': row_data.get(7, '')
+    })
     
-    if not training_data:
-        await update.message.reply_text("В данном периоде тренировок не предусмотрено.")
-        return ConversationHandler.END
+    # Формирование сообщения с тренировкой
+    load_type = row_data[4] if len(row_data) > 4 and row_data[4] else "Не заполнено"
+    train = row_data[5] if len(row_data) > 5 and row_data[5] else "Не заполнено"
+    content = row_data[6] if len(row_data) > 6 and row_data[6] else "Не заполнено"
+    target = row_data[7] if len(row_data) > 7 and row_data[7] else "Не заполнено"
     
-    context.user_data['edit_date'] = date
-    context.user_data['current_field'] = 'workout'
-    
-    keyboard = [['Не менять', 'Добавить']]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        f"Заполните тренировку, текущие данные: {training_data['workout'] or 'Пусто'}\n\n"
-        "Вы можете ввести новое значение или выбрать опцию:",
-        reply_markup=reply_markup
+    message = (
+        f"{date_str} {load_type} нагрузка.\n"
+        f"Тренировка: {train}\n"
+        f"Объем/Содержание: {content}\n"
+        f"Цель: {target}"
     )
     
-    return EDIT_WORKOUT
-
-async def handle_edit_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await handle_edit_field(update, context, 'workout', 'volume', EDIT_VOLUME)
-
-async def handle_edit_volume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await handle_edit_field(update, context, 'volume', 'goal', EDIT_GOAL)
-
-async def handle_edit_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await handle_edit_field(update, context, 'goal', None, None)
-
-async def handle_edit_field(update, context, current_field, next_field, next_state):
-    user_input = update.message.text
-    date = context.user_data['edit_date']
-    worksheet = context.bot_data.get('worksheet')
+    # Кнопки действий
+    keyboard = [
+        [InlineKeyboardButton("Изменить тренировку", callback_data='change')],
+        [InlineKeyboardButton("Поиск новой тренировки", callback_data='new_search')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(message, reply_markup=reply_markup)
     
-    if user_input == 'Не менять':
-        # Пропускаем поле без изменений
-        pass
-    elif user_input == 'Добавить':
-        context.user_data['add_to_field'] = current_field
-        await update.message.reply_text(
-            "Введите дополнительную информацию:",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ADD_TEXT
-    else:
-        # Обновляем поле новым значением
-        success = update_training_data(
-            date, 
-            current_field, 
-            user_input, 
-            worksheet
-        )
-        if not success:
-            await update.message.reply_text("Ошибка при обновлении данных. Попробуйте еще раз.")
-            return get_current_edit_state(current_field)
+    return FOUND_DATE
+
+def find_date_in_sheet(date_str):
+    """Поиск даты в таблице и возврат данных строки"""
+    try:
+        col_values = worksheet.col_values(4)  # Колонка D (даты)
+        if date_str in col_values:
+            row_idx = col_values.index(date_str) + 1
+            return row_idx, worksheet.row_values(row_idx)
+    except Exception as e:
+        logger.error(f"Ошибка поиска даты: {e}")
+    return None
+
+async def handle_found_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка действий после нахождения даты"""
+    query = update.callback_query
+    await query.answer()
     
-    if next_field:
-        # Переходим к следующему полю
-        context.user_data['current_field'] = next_field
-        training_data = get_training_data(date, worksheet)
-        
-        keyboard = [['Не менять', 'Добавить']]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        field_value = training_data.get(next_field) or 'Пусто'
-        field_name = {
-            'volume': 'Объем / Содержание',
-            'goal': 'Цель'
-        }.get(next_field, next_field)
-        
-        await update.message.reply_text(
-            f"Заполните {field_name}, текущие данные: {field_value}\n\n"
-            "Вы можете ввести новое значение или выбрать опцию:",
+    if query.data == 'new_search':
+        await query.edit_message_reply_markup()
+        reply_markup = ReplyKeyboardMarkup([['Сегодня']], resize_keyboard=True)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Введите новую дату в формате ДД.ММ.ГГГГ",
             reply_markup=reply_markup
         )
-        
-        return next_state
-    else:
-        # Все поля обработаны
-        await update.message.reply_text(
-            "Данные по тренировке обновлены!",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ConversationHandler.END
-
-async def handle_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    date = context.user_data['edit_date']
-    field = context.user_data['add_to_field']
-    worksheet = context.bot_data.get('worksheet')
+        return ENTER_DATE
     
-    success = update_training_data(
-        date, 
-        field, 
-        text, 
-        worksheet, 
-        append=True
+    # Переход к изменению тренировки
+    return await ask_change_train(update, context)
+
+async def ask_change_train(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос на изменение тренировки"""
+    query = update.callback_query
+    train = context.user_data['train'] or "Не заполнено"
+    
+    keyboard = [[InlineKeyboardButton("Не менять", callback_data='no_change')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"Текущая тренировка: {train}\nБудешь менять данные?",
+        reply_markup=reply_markup
     )
+    return TRAIN_ANSWER
+
+async def handle_train_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ответа на изменение тренировки"""
+    if update.callback_query:
+        # Обработка кнопки "Не менять"
+        query = update.callback_query
+        await query.answer()
+        return await ask_change_content(update, context)
     
-    if success:
-        # Возвращаемся к редактированию
-        current_field = context.user_data['current_field']
-        state = get_current_edit_state(current_field)
-        
-        # Получаем текущие данные для отображения
-        training_data = get_training_data(date, worksheet)
-        field_value = training_data.get(current_field) or 'Пусто'
-        field_name = {
-            'workout': 'Тренировка',
-            'volume': 'Объем / Содержание',
-            'goal': 'Цель'
-        }.get(current_field, current_field)
-        
-        keyboard = [['Не менять', 'Добавить']]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(
-            f"Данные добавлены! Текущее значение {field_name}: {field_value}\n\n"
-            "Вы можете продолжить редактирование:",
-            reply_markup=reply_markup
-        )
-        
-        return state
+    # Обработка текстового ввода
+    new_train = update.message.text
+    context.user_data['train'] = new_train
+    row_idx = context.user_data['row_idx']
+    
+    # Асинхронное обновление ячейки
+    await asyncio.to_thread(worksheet.update_cell, row_idx, 6, new_train)  # Колонка F
+    
+    return await ask_change_content(update, context)
+
+async def ask_change_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос на изменение объема/содержания"""
+    if update.callback_query:
+        query = update.callback_query
+        chat_id = query.message.chat_id
+        await query.answer()
+        await query.edit_message_reply_markup()
     else:
-        await update.message.reply_text("Ошибка при добавлении данных. Попробуйте еще раз.")
-        return ConversationHandler.END
+        chat_id = update.message.chat_id
+    
+    content = context.user_data['content'] or "Не заполнено"
+    
+    keyboard = [[InlineKeyboardButton("Не менять", callback_data='no_change')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Текущий объем/содержание: {content}\nБудешь менять данные?",
+        reply_markup=reply_markup
+    )
+    return CONTENT_ANSWER
 
-def get_current_edit_state(field):
-    return {
-        'workout': EDIT_WORKOUT,
-        'volume': EDIT_VOLUME,
-        'goal': EDIT_GOAL
-    }.get(field, ConversationHandler.END)
+async def handle_content_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ответа на изменение объема/содержания"""
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        return await ask_change_target(update, context)
+    
+    new_content = update.message.text
+    context.user_data['content'] = new_content
+    row_idx = context.user_data['row_idx']
+    
+    # Асинхронное обновление ячейки
+    await asyncio.to_thread(worksheet.update_cell, row_idx, 7, new_content)  # Колонка G
+    
+    return await ask_change_target(update, context)
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def ask_change_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос на изменение цели"""
+    if update.callback_query:
+        query = update.callback_query
+        chat_id = query.message.chat_id
+        await query.answer()
+        await query.edit_message_reply_markup()
+    else:
+        chat_id = update.message.chat_id
+    
+    target = context.user_data['target'] or "Не заполнено"
+    
+    keyboard = [[InlineKeyboardButton("Не менять", callback_data='no_change')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Текущая цель: {target}\nБудешь менять данные?",
+        reply_markup=reply_markup
+    )
+    return TARGET_ANSWER
+
+async def handle_target_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ответа на изменение цели и завершение"""
+    if update.callback_query:
+        query = update.callback_query
+        chat_id = query.message.chat_id
+        await query.answer()
+        await query.edit_message_reply_markup()
+    else:
+        new_target = update.message.text
+        context.user_data['target'] = new_target
+        row_idx = context.user_data['row_idx']
+        
+        # Асинхронное обновление ячейки
+        await asyncio.to_thread(worksheet.update_cell, row_idx, 8, new_target)  # Колонка H
+        chat_id = update.message.chat_id
+    
+    # Завершение процесса
+    reply_markup = ReplyKeyboardMarkup([['Сегодня']], resize_keyboard=True)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Тренировка обновлена. Для поиска следующей тренировки введите дату в формате ДД.ММ.ГГГГ",
+        reply_markup=reply_markup
+    )
+    return ENTER_DATE
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена операции"""
     await update.message.reply_text(
-        'Действие отменено',
+        'Операция отменена',
         reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
 
-def is_valid_date(date_str):
-    try:
-        datetime.strptime(date_str, "%d.%m.%Y")
-        return True
-    except ValueError:
-        return False
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(msg="Ошибка в обработчике Telegram:", exc_info=context.error)
-    
-    if update and hasattr(update, 'message'):
-        await update.message.reply_text('Произошла ошибка. Пожалуйста, попробуйте позже.')
-
-# ===================== Основная функция =====================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка: {context.error}")
+    if update and hasattr(update, 'message') and update.message:
+        await update.message.reply_text("Произошла ошибка. Пожалуйста, попробуйте снова.")
+    return ENTER_DATE
 
 def main() -> None:
-    # Инициализация Google Sheets
-    try:
-        worksheet = init_google_sheets()
-        logger.info("Успешное подключение к Google Таблице")
-    except Exception as e:
-        logger.error(f"Критическая ошибка подключения к Google Таблицам: {e}")
-        return
-
-    # Создание Application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    """Основная функция запуска бота"""
+    global worksheet
     
-    # Сохраняем объект worksheet в bot_data
-    application.bot_data['worksheet'] = worksheet
-
-    # Обработчики диалогов
+    # Инициализация Google Таблицы
+    try:
+        worksheet = init_google_sheet()
+    except Exception as e:
+        logger.error(f"Ошибка инициализации Google Sheets: {e}")
+        return
+    
+    # Получение токена из переменных окружения
+    token = os.environ.get('TELEGRAM_TOKEN')
+    if not token:
+        logger.error("TELEGRAM_TOKEN не задан")
+        return
+    
+    # Создание обработчика диалога
+    application = Application.builder().token(token).build()
+    
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
-            SELECTING_ACTION: [
-                MessageHandler(
-                    filters.Regex('^Посмотреть тренировку$'), 
-                    view_training
-                ),
-                MessageHandler(
-                    filters.Regex('^Изменить тренировку$'), 
-                    edit_training
-                )
+            ENTER_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_date)
             ],
-            VIEW_DATE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_view_date)
+            FOUND_DATE: [
+                CallbackQueryHandler(handle_found_date)
             ],
-            EDIT_DATE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_date)
+            TRAIN_ANSWER: [
+                CallbackQueryHandler(handle_train_answer, pattern='^no_change$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_train_answer)
             ],
-            EDIT_WORKOUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_workout)
+            CONTENT_ANSWER: [
+                CallbackQueryHandler(handle_content_answer, pattern='^no_change$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_content_answer)
             ],
-            EDIT_VOLUME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_volume)
-            ],
-            EDIT_GOAL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_goal)
-            ],
-            ADD_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_text)
+            TARGET_ANSWER: [
+                CallbackQueryHandler(handle_target_answer, pattern='^no_change$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_target_answer)
             ]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True
     )
-
+    
     application.add_handler(conv_handler)
     application.add_error_handler(error_handler)
-
+    
     # Запуск бота
-    logger.info("Бот запущен")
     application.run_polling()
+    logger.info("Бот запущен")
 
 if __name__ == '__main__':
     main()
