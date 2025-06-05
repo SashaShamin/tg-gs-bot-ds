@@ -53,10 +53,23 @@ def init_google_sheet():
     if not creds_json or not sheet_id:
         raise ValueError("Не заданы переменные окружения")
     
-    creds_data = json.loads(creds_json)
-    scope = ['https://spreadsheets.google.com/feeds', 
-             'https://www.googleapis.com/auth/drive',
-             'https://www.googleapis.com/auth/spreadsheets']
+    try:
+        # Удаляем возможные BOM-символы
+        if creds_json.startswith('\ufeff'):
+            creds_json = creds_json[1:]
+        
+        # Загружаем JSON
+        creds_data = json.loads(creds_json)
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка декодирования JSON: {e}")
+        logger.error(f"Содержимое GOOGLE_CREDENTIALS_JSON: {creds_json[:100]}...")  # Логируем начало для диагностики
+        raise
+    
+    scope = [
+        'https://spreadsheets.google.com/feeds',
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/spreadsheets'
+    ]
     
     creds = Credentials.from_service_account_info(creds_data, scopes=scope)
     gc = gspread.authorize(creds)
